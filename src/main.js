@@ -6,11 +6,16 @@ import { UnrealBloomPass } from 'three/addons/postprocessing/UnrealBloomPass.js'
 import { AfterimagePass } from 'three/addons/postprocessing/AfterimagePass.js';
 import { ShaderPass } from 'three/addons/postprocessing/ShaderPass.js';
 import { OutputPass } from 'three/addons/postprocessing/OutputPass.js';
+import GUI from 'lil-gui';
 
 // ─── Renderer ─────────────────────────────────────────────────────────────────
 const renderer = new THREE.WebGLRenderer({ antialias: true });
 renderer.setSize(window.innerWidth, window.innerHeight);
 renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+// Filmic tone mapping for a shot-on-a-sensor roll-off instead of flat sRGB.
+// OutputPass reads these off the renderer each frame, so changing them live works.
+renderer.toneMapping = THREE.ACESFilmicToneMapping;
+renderer.toneMappingExposure = 0.57;
 document.body.appendChild(renderer.domElement);
 
 const scene = new THREE.Scene();
@@ -21,6 +26,41 @@ camera.position.set(0, 1.5, 9);
 
 // The central light sits at the origin — everything orbits around it.
 const CENTER = new THREE.Vector3(0, 0, 0);
+
+// ─── Tunable parameters (wired to lil-gui below) ──────────────────────────────
+const params = {
+  // Motion blur, turned down from its previous max of 0.88 but still adjustable.
+  // `motionBlur` is the maximum afterimage trail length; `motionResponse` is how
+  // strongly camera speed drives the trail before clamping to that max.
+  motionBlur:     0.25,
+  motionResponse: 4.0,
+  // When locked, the trail is pinned to `motionBlur` regardless of camera motion.
+  trailsLocked:   false,
+  // Per-orb "electron" streaks: each orb stretches along its on-screen motion,
+  // so the faster you orbit the longer the pinpoint streaks become.
+  streaks:        false,
+  streakStrength: 60.0,  // how much apparent speed elongates each orb
+  streakMax:      9.0,    // hard cap on the stretch factor
+  // Color cycling: by default the hue tracks the camera's orbit angle. When
+  // `autoHue` is on, the hue instead drifts continuously over time on its own.
+  autoHue:        false,
+  autoHueSpeed:   0.03,
+  // Tone mapping (applied by OutputPass) + animated sensor grain.
+  toneMapping:    'ACES Filmic',
+  grain:          true,
+  grainAmount:    0.185,
+};
+
+// Friendly label → three.js tone-mapping constant, for the GUI dropdown.
+const TONE_MAPPINGS = {
+  'None':        THREE.NoToneMapping,
+  'Linear':      THREE.LinearToneMapping,
+  'Reinhard':    THREE.ReinhardToneMapping,
+  'Cineon':      THREE.CineonToneMapping,
+  'ACES Filmic': THREE.ACESFilmicToneMapping,
+  'AgX':         THREE.AgXToneMapping,
+  'Neutral':     THREE.NeutralToneMapping,
+};
 
 // ─── Post-processing: Unreal bloom ────────────────────────────────────────────
 const composer = new EffectComposer(renderer);
@@ -90,7 +130,7 @@ const vignettePass = new ShaderPass({
     }
   `,
 });
-vignettePass.enabled = false;
+vignettePass.enabled = true;
 composer.addPass(vignettePass);
 
 // ─── Pixelation ───────────────────────────────────────────────────────────────
@@ -121,6 +161,41 @@ composer.addPass(pixelationPass);
 
 composer.addPass(new OutputPass());
 
+// ─── Film grain ───────────────────────────────────────────────────────────────
+// Applied after tone mapping (in display space) so the grain reads evenly across
+// the tonal range. A per-frame `time` seed animates the noise so it shimmers.
+const grainPass = new ShaderPass({
+  uniforms: {
+    tDiffuse: { value: null },
+    amount:   { value: params.grainAmount },
+    time:     { value: 0 },
+  },
+  vertexShader: `
+    varying vec2 vUv;
+    void main() { vUv = uv; gl_Position = projectionMatrix * modelViewMatrix * vec4(position,1.0); }
+  `,
+  fragmentShader: `
+    uniform sampler2D tDiffuse;
+    uniform float amount;
+    uniform float time;
+    varying vec2 vUv;
+    float rand(vec2 co) {
+      return fract(sin(dot(co, vec2(12.9898, 78.233))) * 43758.5453);
+    }
+    void main() {
+      vec4 color = texture2D(tDiffuse, vUv);
+      // animate the noise field and tie its strength to luminance so shadows
+      // stay grainier than highlights — closer to real film.
+      float n = rand(vUv + fract(time)) - 0.5;
+      float luma = dot(color.rgb, vec3(0.299, 0.587, 0.114));
+      color.rgb += n * amount * (1.0 - luma * 0.7);
+      gl_FragColor = color;
+    }
+  `,
+});
+grainPass.enabled = params.grain;
+composer.addPass(grainPass);
+
 // ─── Orbit controls (light stays locked at the center) ────────────────────────
 const controls = new OrbitControls(camera, renderer.domElement);
 controls.target.copy(CENTER);
@@ -140,6 +215,7 @@ const raycaster   = new THREE.Raycaster();
 const mouseNDC    = new THREE.Vector2(0, 0);
 const mouseTarget = new THREE.Vector3();   // raw projected point
 const mouseWorld  = new THREE.Vector3();   // smoothed attractor
+const _ndc        = new THREE.Vector3();   // scratch for projecting orbs to screen
 
 window.addEventListener('pointermove', e => {
   mouseNDC.x =  (e.clientX / window.innerWidth)  * 2 - 1;
@@ -244,6 +320,8 @@ for (let i = 0; i < N; i++) {
     speed:  0.2 + Math.random() * 0.45,
     drift:  0.05 + Math.random() * 0.12,
     baseHue, sat, light,
+    // streak tracking: previous on-screen (NDC) position, smoothed stretch & roll
+    sx: 0, sy: 0, inited: false, stretch: 0, roll: 0,
   });
 }
 
@@ -281,24 +359,26 @@ window.addEventListener('resize', () => {
 });
 
 // ─── Keyboard toggles ─────────────────────────────────────────────────────────
-let trailsLocked = false;
-
 window.addEventListener('keydown', e => {
   switch (e.key.toLowerCase()) {
     case 'c':
       chromaticPass.enabled = !chromaticPass.enabled;
+      chromaCtrl.updateDisplay();
       updateHUD();
       break;
     case 'v':
       vignettePass.enabled = !vignettePass.enabled;
+      vignetteCtrl.updateDisplay();
       updateHUD();
       break;
     case 'x':
       pixelationPass.enabled = !pixelationPass.enabled;
+      pixelCtrl.updateDisplay();
       updateHUD();
       break;
     case 'z':
-      trailsLocked = !trailsLocked;
+      grainPass.enabled = !grainPass.enabled;
+      grainCtrl.updateDisplay();
       updateHUD();
       break;
   }
@@ -311,13 +391,70 @@ function updateHUD() {
     `<span class="${chromaticPass.enabled  ? 'on' : ''}">C  chroma</span>`,
     `<span class="${vignettePass.enabled   ? 'on' : ''}">V  vignette</span>`,
     `<span class="${pixelationPass.enabled ? 'on' : ''}">X  pixel</span>`,
-    `<span class="${trailsLocked          ? 'on' : ''}">Z  trails</span>`,
+    `<span class="${grainPass.enabled      ? 'on' : ''}">Z  grain</span>`,
   ].join('');
 }
+
+// ─── lil-gui controls ─────────────────────────────────────────────────────────
+const gui = new GUI({ title: 'bluelight' });
+
+const fMotion = gui.addFolder('Motion blur');
+fMotion.add(params, 'motionBlur', 0.0, 0.95, 0.01).name('amount');
+fMotion.add(params, 'motionResponse', 0.0, 12.0, 0.1).name('speed response');
+const trailsCtrl = fMotion.add(params, 'trailsLocked').name('lock trails (Z)')
+  .onChange(updateHUD);
+
+const fStreaks = gui.addFolder('Electron streaks');
+fStreaks.add(params, 'streaks').name('enabled')
+  .onChange(v => { if (!v) for (const m of meta) { m.stretch = 0; m.inited = false; } });
+fStreaks.add(params, 'streakStrength', 0.0, 200.0, 1.0).name('strength');
+fStreaks.add(params, 'streakMax', 0.0, 24.0, 0.5).name('max length');
+
+const fColor = gui.addFolder('Color');
+fColor.add(params, 'autoHue').name('time-based hue');
+fColor.add(params, 'autoHueSpeed', -0.3, 0.3, 0.005).name('hue speed');
+
+const fBloom = gui.addFolder('Bloom');
+fBloom.add(bloomPass, 'strength', 0.0, 2.0, 0.01);
+fBloom.add(bloomPass, 'radius', 0.0, 1.5, 0.01);
+fBloom.add(bloomPass, 'threshold', 0.0, 1.0, 0.01);
+
+const fChroma = gui.addFolder('Chromatic aberration');
+const chromaCtrl = fChroma.add(chromaticPass, 'enabled').name('enabled (C)')
+  .onChange(updateHUD);
+fChroma.add(chromaticPass.uniforms.amount, 'value', 0.0, 0.02, 0.0005).name('amount');
+
+const fVignette = gui.addFolder('Vignette');
+const vignetteCtrl = fVignette.add(vignettePass, 'enabled').name('enabled (V)')
+  .onChange(updateHUD);
+fVignette.add(vignettePass.uniforms.strength, 'value', 0.0, 2.0, 0.01).name('strength');
+fVignette.add(vignettePass.uniforms.softness, 'value', 0.0, 1.0, 0.01).name('softness');
+
+const fPixel = gui.addFolder('Pixelation');
+const pixelCtrl = fPixel.add(pixelationPass, 'enabled').name('enabled (X)')
+  .onChange(updateHUD);
+fPixel.add(pixelationPass.uniforms.pixelSize, 'value', 1.0, 16.0, 1.0).name('pixel size');
+
+const fFilm = gui.addFolder('Tone & grain');
+fFilm.add(params, 'toneMapping', Object.keys(TONE_MAPPINGS)).name('tone mapping')
+  .onChange(v => { renderer.toneMapping = TONE_MAPPINGS[v]; });
+fFilm.add(renderer, 'toneMappingExposure', 0.0, 3.0, 0.01).name('exposure');
+const grainCtrl = fFilm.add(grainPass, 'enabled').name('grain (Z)');
+fFilm.add(grainPass.uniforms.amount, 'value', 0.0, 0.3, 0.005).name('grain amount');
+
+const fOrbit = gui.addFolder('Camera');
+fOrbit.add(controls, 'autoRotate').name('auto-rotate');
+fOrbit.add(controls, 'autoRotateSpeed', -5.0, 5.0, 0.1).name('auto-rotate speed');
+
+// Start with every folder collapsed.
+gui.folders.forEach(f => f.close());
 
 // ─── Hint fade ────────────────────────────────────────────────────────────────
 const hint = document.getElementById('hint');
 if (hint) setTimeout(() => (hint.style.opacity = '0'), 4000);
+
+// reflect the initial pass states (e.g. vignette on) in the HUD
+updateHUD();
 
 // ─── Animate ──────────────────────────────────────────────────────────────────
 let clock = 0;
@@ -327,9 +464,12 @@ function animate() {
   requestAnimationFrame(animate);
   clock += 0.008;
 
-  // orbit angle → hue offset: a full turn cycles the whole color wheel,
-  // while the default front view (azimuth ≈ 0) keeps the orbs blue.
-  const hueShift = controls.getAzimuthalAngle() / (Math.PI * 2);
+  // hue offset: either the camera's orbit angle (a full turn cycles the whole
+  // color wheel, front view stays blue) or, when autoHue is on, a continuous
+  // time-based drift independent of the camera.
+  const hueShift = params.autoHue
+    ? clock * params.autoHueSpeed
+    : controls.getAzimuthalAngle() / (Math.PI * 2);
 
   // project the pointer into the world at the sphere's depth, smoothed
   raycaster.setFromCamera(mouseNDC, camera);
@@ -361,7 +501,31 @@ function animate() {
       m.sat,
       m.light
     );
+
+    // ── electron streaks ──
+    // Project the orb to the screen and measure how far it moved since last
+    // frame (in NDC). That apparent motion — dominated by camera orbiting —
+    // sets the streak's direction (roll) and length (stretch along local X).
+    let targetStretch = 0;
+    if (params.streaks) {
+      _ndc.set(px, py, pz).project(camera);
+      if (m.inited) {
+        const dx = _ndc.x - m.sx;
+        const dy = _ndc.y - m.sy;
+        const sp = Math.hypot(dx, dy);
+        if (sp > 1e-4) m.roll = Math.atan2(dy, dx);
+        targetStretch = Math.min(sp * params.streakStrength, params.streakMax);
+      }
+      m.sx = _ndc.x; m.sy = _ndc.y; m.inited = true;
+    }
+    // ease toward the target so streaks grow/shrink smoothly instead of popping
+    m.stretch += (targetStretch - m.stretch) * 0.35;
+
+    // billboard to the camera, then roll so local X aligns with the motion
+    // direction and stretch along it — a thin, pinpoint streak of light.
     m.mesh.quaternion.copy(camera.quaternion);
+    m.mesh.rotateZ(m.roll);
+    m.mesh.scale.set(1 + m.stretch, 1, 1);
   }
 
   // pulse the central light
@@ -379,9 +543,13 @@ function animate() {
   // When trailsLocked, pin damp to max regardless of camera movement.
   const camSpeed = camera.position.distanceTo(prevCamPos);
   prevCamPos.copy(camera.position);
-  const targetDamp = trailsLocked ? 0.88 : Math.min(camSpeed * 4.0, 0.88);
+  const targetDamp = params.trailsLocked
+    ? params.motionBlur
+    : Math.min(camSpeed * params.motionResponse, params.motionBlur);
   const damp = afterimagePass.uniforms['damp'];
   damp.value += (targetDamp - damp.value) * 0.25;
+
+  grainPass.uniforms.time.value = clock;
 
   composer.render();
 }
